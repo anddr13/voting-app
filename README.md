@@ -82,8 +82,8 @@ cd services/vote-api && npm ci && npm test     # same for worker and result-api
 
 One-time setup:
 - Secret `GITOPS_TOKEN`: a fine-grained PAT with **Contents: Read and write** on `voting-gitops` only.
-- After the first push, make the `voting-vote-api`, `voting-worker` and `voting-result-api` packages public
-  (GitHub → Packages → Package settings → Change visibility), otherwise the clusters cannot pull them.
+- The clusters pull the images anonymously. Packages pushed from a public repository come out public; if this repo
+  is private, make the `voting-*` packages public (GitHub → Packages → Package settings → Change visibility).
 
 > npm 11 no longer runs dependency install scripts by default. The Kafka client needs its script (it downloads
 > the prebuilt librdkafka binary), so it is explicitly allowed in `allowScripts` in `package.json`.

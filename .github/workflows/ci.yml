@@ -85,7 +85,9 @@ jobs:
         env:
           TAG: ${{ github.sha }}
         run: |
-          yq -i '.image.tag = strenv(TAG)' charts/voting/values.yaml
+          # sed, not yq: yq would rewrite the formatting of the whole file on every release.
+          sed -i -E "s/^(  tag: ).*/\1${TAG}/" charts/voting/values.yaml
+          grep -q "^  tag: ${TAG}$" charts/voting/values.yaml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "voting: release ${TAG::7}"

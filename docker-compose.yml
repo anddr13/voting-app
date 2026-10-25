@@ -1,0 +1,106 @@
+# Local stack: the same three services plus Kafka, Redis and MongoDB.
+# Caddy plays the role of the Kubernetes Ingress: /api/vote -> vote-api, everything else -> result-api.
+name: voting
+
+x-app-env: &app-env
+  KAFKA_BROKERS: kafka:9092
+  REDIS_URL: redis://redis:6379
+  MONGO_URL: mongodb://mongo:27017/?directConnection=true
+  VOTE_OPTIONS: cat,dog
+  CLOUD_NAME: local
+
+services:
+  kafka:
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are declared explicitly (kafka-init here, KafkaTopic in Kubernetes).
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+  kafka-init:
+    image: apache/kafka:4.3.1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic votes --partitions 6 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic votes-dlq --partitions 1 --replication-factor 1
+    depends_on:
+      kafka: { condition: service_healthy }
+    restart: "no"
+
+  redis:
+    image: redis:8.6-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  mongo:
+    image: mongo:8.0
+    # Transactions need a replica set; a single-member one is enough.
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    healthcheck:
+      # Initiates the replica set on first run and reports healthy only once this node is primary.
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - "try { rs.status() } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'localhost:27017' }] }) }; if (!db.hello().isWritablePrimary) quit(1)"
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  vote-api:
+    build: services/vote-api
+    environment: *app-env
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: on-failure
+
+  worker:
+    build: services/worker
+    environment:
+      <<: *app-env
+      PROCESSING_DELAY_MS: ${PROCESSING_DELAY_MS:-0}
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      mongo: { condition: service_healthy }
+    restart: on-failure
+
+  result-api:
+    build: services/result-api
+    environment: *app-env
+    depends_on:
+      redis: { condition: service_healthy }
+      mongo: { condition: service_healthy }
+    restart: on-failure
+
+  ingress:
+    image: caddy:2-alpine
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "8080:8080"
+    depends_on: [vote-api, result-api]

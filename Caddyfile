@@ -1,0 +1,4 @@
+:8080 {
+	reverse_proxy /api/vote vote-api:8080
+	reverse_proxy result-api:8080
+}

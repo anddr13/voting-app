@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cats vs Dogs</title>
+  <style>
+    :root {
+      --bg: #f6f5f2; --card: #ffffff; --text: #1d1d1f; --muted: #6b6b70;
+      --border: #e3e1dc; --cat: #e07a3f; --dog: #3f7ae0; --track: #eeece7;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #141416; --card: #1d1d20; --text: #f2f2f3; --muted: #9a9aa2;
+        --border: #2c2c31; --track: #2a2a2f;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px;
+      background: var(--bg); color: var(--text);
+      font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(480px, 100%); background: var(--card); border: 1px solid var(--border);
+      border-radius: 16px; padding: 28px;
+    }
+    h1 { margin: 0 0 4px; font-size: 1.6rem; }
+    .meta { margin: 0 0 24px; color: var(--muted); font-size: .85rem; }
+    .row { margin-bottom: 18px; }
+    .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+    button {
+      font: inherit; font-weight: 600; padding: 6px 16px; border-radius: 999px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--card); color: var(--text);
+    }
+    button:hover { border-color: var(--muted); }
+    .count { font-variant-numeric: tabular-nums; color: var(--muted); }
+    .track { height: 12px; background: var(--track); border-radius: 999px; overflow: hidden; }
+    .bar { height: 100%; width: 0; border-radius: 999px; transition: width .4s ease; }
+    #status { min-height: 1.5em; margin: 8px 0 0; color: var(--muted); font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Cats vs Dogs</h1>
+    <p class="meta" id="meta">connecting…</p>
+    <div id="options"></div>
+    <p id="status" role="status"></p>
+  </main>
+
+  <script>
+    const labels = { cat: 'Cat 🐱', dog: 'Dog 🐶' };
+    const colors = { cat: 'var(--cat)', dog: 'var(--dog)' };
+    const optionsEl = document.getElementById('options');
+    const statusEl = document.getElementById('status');
+
+    // crypto.randomUUID() needs HTTPS, and the demo runs over plain HTTP on a load balancer IP.
+    function newClientId() {
+      return Math.random().toString(36).slice(2) + Date.now().toString(36);
+    }
+    let clientId = null;
+    try {
+      clientId = localStorage.getItem('clientId') || newClientId();
+      localStorage.setItem('clientId', clientId);
+    } catch {
+      clientId = newClientId();
+    }
+
+    function render(options) {
+      optionsEl.innerHTML = '';
+      for (const option of options) {
+        const row = document.createElement('div');
+        row.className = 'row';
+        row.innerHTML = `
+          <div class="head">
+            <button type="button">${labels[option] ?? option}</button>
+            <span class="count" id="count-${option}">0</span>
+          </div>
+          <div class="track"><div class="bar" id="bar-${option}"></div></div>`;
+        row.querySelector('.bar').style.background = colors[option] ?? 'var(--muted)';
+        row.querySelector('button').addEventListener('click', () => vote(option));
+        optionsEl.appendChild(row);
+      }
+    }
+
+    function update(tallies) {
+      const total = Object.values(tallies).reduce((sum, n) => sum + n, 0);
+      for (const [option, count] of Object.entries(tallies)) {
+        const share = total ? Math.round((count / total) * 100) : 0;
+        document.getElementById(`count-${option}`).textContent = `${count} · ${share}%`;
+        document.getElementById(`bar-${option}`).style.width = `${share}%`;
+      }
+    }
+
+    async function vote(option) {
+      const res = await fetch('/api/vote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Client-Id': clientId },
+        body: JSON.stringify({ option }),
+      });
+      if (res.status === 202) {
+        statusEl.textContent = 'Vote accepted, counting…';
+      } else {
+        const body = await res.json().catch(() => ({}));
+        statusEl.textContent = body.error ?? `Error ${res.status}`;
+      }
+    }
+
+    async function init() {
+      const info = await (await fetch('/api/info')).json();
+      document.getElementById('meta').textContent =
+        `served from ${info.cloud} · build ${String(info.version).slice(0, 7)}`;
+      render(info.options);
+      const stream = new EventSource('/api/stream');
+      stream.onmessage = (event) => update(JSON.parse(event.data));
+      stream.onerror = () => { statusEl.textContent = 'Live updates reconnecting…'; };
+      stream.onopen = () => { statusEl.textContent = ''; };
+    }
+
+    init().catch((err) => { statusEl.textContent = `Failed to load: ${err.message}`; });
+  </script>
+</body>
+</html>

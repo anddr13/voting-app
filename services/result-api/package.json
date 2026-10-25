@@ -1,0 +1,19 @@
+{
+  "name": "result-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serves the UI and streams live results from Redis over SSE",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^5.3.0",
+    "ioredis": "^6.0.0",
+    "mongodb": "^7.7.0"
+  }
+}

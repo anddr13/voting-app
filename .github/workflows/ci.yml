@@ -3,7 +3,10 @@ name: ci
 on:
   push:
     branches: [main]
+    # Docs do not change the images, so they must not cut a release (new tag in voting-gitops).
+    paths-ignore: ["**.md"]
   pull_request:
+    paths-ignore: ["**.md"]
 
 permissions:
   contents: read

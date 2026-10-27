@@ -83,15 +83,54 @@ result-api ◀──SUBSCRIBE──── Redis ◀──HSET + PUBLISH───
 | `worker` | Consumes Kafka (consumer group `vote-workers`). In a single MongoDB transaction it inserts the event with `_id = voteId` and `$inc`s the tally, so a redelivered message hits a duplicate key and is not counted twice. Unparseable messages go to `votes-dlq`. After the commit it writes the **absolute** count to Redis and publishes an update. |
 | `result-api` | Serves the UI, `/api/results` and live updates over SSE (Redis pub/sub, at most one snapshot per 250 ms). Rebuilds the cache from Mongo when Redis is empty. |
 
-Design choices:
-- **Kafka as a buffer.** A burst of votes never hits the database directly: `vote-api` answers immediately and `worker` catches up. In Kubernetes, KEDA scales `worker` on consumer lag.
-- **At-least-once delivery + idempotency.** Kafka may redeliver; the unique `voteId` guarantees each vote is counted exactly once.
-- **Mongo is the source of truth, Redis is a cache.** Redis can be wiped completely and the counts come back.
-
 The Kafka client is [`@confluentinc/kafka-javascript`](https://github.com/confluentinc/confluent-kafka-javascript)
 (librdkafka with a KafkaJS-style API); `kafkajs` itself has not been released since 2023.
 
-### Run locally
+## Design decisions
+
+**The scenario:** live voting during a broadcast. Votes arrive in bursts (a few minutes of voting, then silence), and
+far more people watch the results than vote. A steady 200 votes/s would need nothing more than one service in front of
+PostgreSQL; every extra component is there for the bursts or for the readers.
+
+| Component | What it solves | Without it | Simpler alternative |
+|---|---|---|---|
+| **Kafka** | Accepting a vote is decoupled from storing it: `vote-api` answers `202` even when the database is slow or down, and a burst waits in the log until the workers drain it. 24 h retention allows a replay; unparseable messages go to a DLQ. | The burst hits the database directly: requests time out and voters see errors. | Redis Streams, a managed queue (SQS, Pub/Sub, Service Bus), or a queue table in PostgreSQL with `FOR UPDATE SKIP LOCKED`. |
+| **Redis** | State shared by all replicas: the rate limit (`SET NX EX`) for every `vote-api` pod, a tally cache so readers never reach the database, and pub/sub that tells every `result-api` pod to push an update over SSE. | A per-pod rate limit, bypassed because the load balancer spreads requests; every viewer polls the database. | PostgreSQL `LISTEN/NOTIFY` plus a cache in process memory. |
+| **KEDA** | Scales the worker on consumer lag, the signal that actually describes a queue consumer. | A CPU-based HPA misses the backlog: the worker mostly waits on I/O, so CPU stays low while the lag grows. | An HPA on an external metric through Prometheus Adapter: more moving parts, same result. |
+
+**Exactly-once counting is the core of the design.** Kafka delivers at least once: after a worker crash or a consumer
+group rebalance, the same message can arrive again. The worker inserts the vote with `_id = voteId` and increments the
+tally in the same MongoDB transaction, so a redelivered vote fails on the duplicate key and changes nothing. Redis gets
+the absolute count returned by that transaction, never an increment, so a repeated cache update is harmless too. On
+the way in, the idempotent producer keeps network retries from writing the same message to Kafka twice. Verified in
+every environment: each accepted vote was stored exactly once (see [Results](#results)).
+
+**Why MongoDB and not PostgreSQL.** PostgreSQL fits this data at least as well: a vote and a tally are fixed-shape rows,
+and `INSERT ... ON CONFLICT DO NOTHING` plus `UPDATE ... SET count = count + 1` in one transaction give the same
+guarantee on a single instance. MongoDB allows transactions only on a replica set, hence the one-member replica set.
+Managed MongoDB also differs from cloud to cloud (Amazon DocumentDB, Azure Cosmos DB for MongoDB, Firestore with
+MongoDB compatibility, or Atlas), while all three run PostgreSQL natively. MongoDB was chosen on purpose, to show a
+document store next to Kafka and Redis; a production system with this data model would use PostgreSQL.
+
+**Self-hosted, not managed services.** Kafka (Strimzi), Redis and MongoDB run inside the cluster, so the same charts
+work on AKS, EKS, GKE and kind, and a sandbox that lives a few hours costs nothing beyond its nodes. In production,
+the managed Kafka and Redis that every cloud offers would trade this portability for less operational work.
+
+What a production version would change:
+- **Everything runs as a single replica.** One Kafka broker with replication factor 1, one Redis pod, a one-member
+  MongoDB replica set: losing a disk loses data. That keeps a sandbox on two small nodes; production needs 3 brokers
+  with `replication.factor=3` and `min.insync.replicas=2`, a 3-member replica set (or HA PostgreSQL) and a replicated Redis.
+- **The 20 ms processing delay is synthetic.** It stands in for real per-vote work (fraud checks, enrichment) and makes
+  the backlog visible in a 3-minute test. Without it a message takes ~10 ms on AKS (~30 ms measured minus the delay),
+  so two workers would keep up with 200 votes/s.
+- **One vote per transaction.** Processing votes in batches would raise throughput without adding pods. Scaling out
+  stops at six workers anyway: the topic has 6 partitions. Partitions can be added later, but that moves keys to
+  different partitions, so the number is chosen up front.
+- **Results are eventually consistent.** `202` means accepted, not counted yet. Normally the tally catches up within a
+  fraction of a second; while a backlog drains, it trails by the consumer lag (thousands of votes in the tests above).
+  Fine for a vote, not for a payment.
+
+## Run locally
 
 ```bash
 docker compose up -d --build
@@ -110,7 +149,7 @@ curl localhost:8080/api/results
 curl -N localhost:8080/api/stream
 ```
 
-### Load test (k6)
+## Load test (k6)
 
 ```bash
 docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6:2.3.0 run - < loadtest/votes.js
@@ -122,13 +161,13 @@ To watch consumer lag grow (and, in a cluster, KEDA adding workers), slow proces
 Verified with compose: 3,006 votes under load, every one counted exactly once, p95 latency 15 ms, 0 errors.
 Redelivered messages, poison messages (→ DLQ) and a full Redis flush were tested as well.
 
-### Tests
+## Tests
 
 ```bash
 cd services/vote-api && npm ci && npm test     # same for worker and result-api
 ```
 
-### CI/CD
+## CI/CD
 
 `.github/workflows/ci.yml`:
 1. **test**: `npm ci` + `npm test` for every service.

@@ -1,11 +1,15 @@
-# Local stack: the same three services plus Kafka, Redis and MongoDB.
+# Local stack: the same three services plus Kafka, Redis and PostgreSQL.
 # Caddy plays the role of the Kubernetes Ingress: /api/vote -> vote-api, everything else -> result-api.
 name: voting
 
 x-app-env: &app-env
   KAFKA_BROKERS: kafka:9092
   REDIS_URL: redis://redis:6379
-  MONGO_URL: mongodb://mongo:27017/?directConnection=true
+  # Local throwaway database; in Kubernetes the credentials come from the CloudNativePG Secret.
+  PGHOST: postgres
+  PGDATABASE: voting
+  PGUSER: voting
+  PGPASSWORD: voting
   VOTE_OPTIONS: cat,dog
   CLOUD_NAME: local
 
@@ -53,21 +57,25 @@ services:
       interval: 5s
       retries: 10
 
-  mongo:
-    image: mongo:8.0
-    # Transactions need a replica set; a single-member one is enough.
-    command: ["--replSet", "rs0", "--bind_ip_all"]
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: voting
+      POSTGRES_USER: voting
+      POSTGRES_PASSWORD: voting
     healthcheck:
-      # Initiates the replica set on first run and reports healthy only once this node is primary.
-      test:
-        - CMD
-        - mongosh
-        - --quiet
-        - --eval
-        - "try { rs.status() } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'localhost:27017' }] }) }; if (!db.hello().isWritablePrimary) quit(1)"
+      test: ["CMD", "pg_isready", "-U", "voting", "-d", "voting"]
       interval: 5s
-      timeout: 10s
-      retries: 30
+      retries: 20
+
+  # Schema migrations, the compose counterpart of the PreSync Job in voting-gitops.
+  migrate:
+    build: services/worker
+    command: ["node", "src/migrate.js"]
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
 
   vote-api:
     build: services/vote-api
@@ -85,7 +93,7 @@ services:
     depends_on:
       kafka-init: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
-      mongo: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
     restart: on-failure
 
   result-api:
@@ -93,7 +101,7 @@ services:
     environment: *app-env
     depends_on:
       redis: { condition: service_healthy }
-      mongo: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
     restart: on-failure
 
   ingress:

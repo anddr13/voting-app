@@ -3,27 +3,27 @@
 const path = require('node:path');
 const express = require('express');
 const Redis = require('ioredis');
-const { MongoClient } = require('mongodb');
+const { Pool } = require('pg');
 const config = require('./config');
 const { normalizeTallies } = require('./results');
 
 const redis = new Redis(config.redisUrl);
 const subscriber = redis.duplicate();
-const mongo = new MongoClient(config.mongoUrl);
+const pool = new Pool({ max: config.pgPoolMax, application_name: 'result-api', connectionTimeoutMillis: 5_000 });
 const streams = new Set();
-let mongoReady = false;
+let dbReady = false;
 
 async function loadResults() {
   const cached = normalizeTallies(await redis.hgetall('tallies'), config.voteOptions);
   if (Object.values(cached).some((count) => count > 0)) return cached;
 
-  // Cold cache (fresh or restarted Redis): rebuild it from Mongo, the source of truth.
-  const docs = await mongo.db(config.mongoDb).collection('tallies').find().toArray();
+  // Cold cache (fresh or restarted Redis): rebuild it from PostgreSQL, the source of truth.
+  const { rows } = await pool.query('SELECT option, count FROM tallies');
   const fromDb = normalizeTallies(
-    Object.fromEntries(docs.map((doc) => [doc._id, doc.count])),
+    Object.fromEntries(rows.map((row) => [row.option, row.count])),
     config.voteOptions,
   );
-  if (docs.length > 0) await redis.hset('tallies', fromDb);
+  if (rows.length > 0) await redis.hset('tallies', fromDb);
   return fromDb;
 }
 
@@ -55,7 +55,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 app.get('/healthz', (_req, res) => res.send('ok'));
 
 app.get('/readyz', (_req, res) => {
-  const ready = mongoReady && redis.status === 'ready' && subscriber.status === 'ready';
+  const ready = dbReady && redis.status === 'ready' && subscriber.status === 'ready';
   res.status(ready ? 200 : 503).send(ready ? 'ready' : 'not ready');
 });
 
@@ -81,15 +81,15 @@ app.use((err, _req, res, _next) => {
 });
 
 async function main() {
-  await mongo.connect();
-  mongoReady = true;
+  await pool.query('SELECT 1');
+  dbReady = true;
   await subscriber.subscribe('tallies:updates');
   const server = app.listen(config.port, () => console.log(`result-api listening on :${config.port}`));
 
   const shutdown = async () => {
     for (const res of streams) res.end();
     server.close();
-    await mongo.close().catch(() => {});
+    await pool.end().catch(() => {});
     subscriber.disconnect();
     redis.disconnect();
     process.exit(0);

@@ -1,49 +1,30 @@
 'use strict';
 
-const { MongoClient } = require('mongodb');
+const { Pool } = require('pg');
 
-const DUPLICATE_KEY = 11000;
-
-async function connectStore(url, dbName) {
-  const client = new MongoClient(url);
-  await client.connect();
-  const db = client.db(dbName);
-
-  // Collections are created up front so the transaction below never has to create them.
-  for (const name of ['votes', 'tallies']) {
-    await db.createCollection(name).catch((err) => {
-      if (err.codeName !== 'NamespaceExists') throw err;
-    });
-  }
-  await db.collection('votes').createIndex({ option: 1, ts: -1 });
-  return { client, db };
+// Connection settings come from the standard PG* variables (PGHOST, PGUSER, PGPASSWORD, ...).
+function createPool(max) {
+  return new Pool({ max, application_name: 'worker', connectionTimeoutMillis: 5_000 });
 }
 
-// Stores the vote and bumps its tally in one transaction.
+// One statement, so one implicit transaction: the vote is stored and its tally bumped together.
+// A redelivered vote hits ON CONFLICT, inserts nothing, and therefore bumps nothing.
+const RECORD_VOTE = `
+  WITH inserted AS (
+    INSERT INTO votes (vote_id, option, client_id, ts)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (vote_id) DO NOTHING
+    RETURNING option
+  )
+  INSERT INTO tallies (option, count)
+  SELECT option, 1 FROM inserted
+  ON CONFLICT (option) DO UPDATE SET count = tallies.count + 1
+  RETURNING count`;
+
 // Returns the new tally, or null when the vote was already stored (Kafka redelivery).
-async function recordVote({ client, db }, event) {
-  const session = client.startSession();
-  try {
-    let count = null;
-    await session.withTransaction(async () => {
-      await db.collection('votes').insertOne(
-        { _id: event.voteId, option: event.option, clientId: event.clientId, ts: event.ts },
-        { session },
-      );
-      const tally = await db.collection('tallies').findOneAndUpdate(
-        { _id: event.option },
-        { $inc: { count: 1 } },
-        { upsert: true, returnDocument: 'after', session },
-      );
-      count = tally.count;
-    });
-    return count;
-  } catch (err) {
-    if (err.code === DUPLICATE_KEY) return null;
-    throw err;
-  } finally {
-    await session.endSession();
-  }
+async function recordVote(pool, event) {
+  const { rows } = await pool.query(RECORD_VOTE, [event.voteId, event.option, event.clientId, event.ts]);
+  return rows.length ? Number(rows[0].count) : null;
 }
 
-module.exports = { connectStore, recordVote };
+module.exports = { createPool, recordVote };

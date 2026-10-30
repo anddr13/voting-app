@@ -6,7 +6,7 @@ const Redis = require('ioredis');
 const { Kafka, logLevel } = require('@confluentinc/kafka-javascript').KafkaJS;
 const config = require('./config');
 const { parseEvent } = require('./event');
-const { connectStore, recordVote } = require('./store');
+const { createPool, recordVote } = require('./store');
 
 const redis = new Redis(config.redisUrl);
 const kafka = new Kafka({
@@ -28,7 +28,7 @@ const health = http.createServer((req, res) => {
   res.writeHead(ok ? 200 : 503).end(ok ? 'ok' : 'not ready');
 });
 
-async function handle(store, message) {
+async function handle(pool, message) {
   const event = parseEvent(message.value, config.voteOptions);
   if (!event) {
     // Poison message: park it in the DLQ instead of blocking the partition forever.
@@ -37,10 +37,10 @@ async function handle(store, message) {
   }
   if (config.processingDelayMs > 0) await sleep(config.processingDelayMs);
 
-  const count = await recordVote(store, event);
+  const count = await recordVote(pool, event);
   if (count === null) return;
 
-  // Mongo is the source of truth. Redis gets the absolute value, so replays are harmless.
+  // PostgreSQL is the source of truth. Redis gets the absolute value, so replays are harmless.
   await redis
     .multi()
     .hset('tallies', event.option, count)
@@ -51,11 +51,12 @@ async function handle(store, message) {
 async function main() {
   health.listen(config.port, () => console.log(`worker health on :${config.port}`));
 
-  const store = await connectStore(config.mongoUrl, config.mongoDb);
+  const pool = createPool(config.pgPoolMax);
+  await pool.query('SELECT 1');
   await dlq.connect();
   await consumer.connect();
   await consumer.subscribe({ topics: [config.kafkaTopic] });
-  await consumer.run({ eachMessage: ({ message }) => handle(store, message) });
+  await consumer.run({ eachMessage: ({ message }) => handle(pool, message) });
   consuming = true;
   console.log(`worker consuming ${config.kafkaTopic} as ${config.groupId}`);
 
@@ -63,7 +64,7 @@ async function main() {
     consuming = false;
     await consumer.disconnect().catch(() => {});
     await dlq.disconnect().catch(() => {});
-    await store.client.close().catch(() => {});
+    await pool.end().catch(() => {});
     redis.disconnect();
     health.close();
     process.exit(0);

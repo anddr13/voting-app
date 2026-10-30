@@ -2,7 +2,7 @@
   "name": "worker",
   "version": "1.0.0",
   "private": true,
-  "description": "Consumes votes from Kafka, stores them in MongoDB and refreshes counters in Redis",
+  "description": "Consumes votes from Kafka, stores them in PostgreSQL and refreshes counters in Redis",
   "main": "src/index.js",
   "engines": {
     "node": ">=24"
@@ -14,7 +14,7 @@
   "dependencies": {
     "@confluentinc/kafka-javascript": "^1.11.0",
     "ioredis": "^6.0.0",
-    "mongodb": "^7.7.0"
+    "pg": "^8.23.1"
   },
   "allowScripts": {
     "@confluentinc/kafka-javascript@1.11.0": true

@@ -7,6 +7,7 @@ const { Kafka, logLevel } = require('@confluentinc/kafka-javascript').KafkaJS;
 const config = require('./config');
 const { parseEvent } = require('./event');
 const { createPool, recordVote } = require('./store');
+const metrics = require('./metrics');
 
 const redis = new Redis(config.redisUrl);
 const kafka = new Kafka({
@@ -23,7 +24,11 @@ const dlq = kafka.producer();
 
 let consuming = false;
 
-const health = http.createServer((req, res) => {
+const health = http.createServer(async (req, res) => {
+  if (req.url === '/metrics') {
+    res.writeHead(200, { 'Content-Type': metrics.register.contentType }).end(await metrics.register.metrics());
+    return;
+  }
   const ok = req.url === '/healthz' || (req.url === '/readyz' && consuming);
   res.writeHead(ok ? 200 : 503).end(ok ? 'ok' : 'not ready');
 });
@@ -33,12 +38,17 @@ async function handle(pool, message) {
   if (!event) {
     // Poison message: park it in the DLQ instead of blocking the partition forever.
     await dlq.send({ topic: config.dlqTopic, messages: [{ key: message.key, value: message.value }] });
+    metrics.votes.labels('dlq').inc();
     return;
   }
   if (config.processingDelayMs > 0) await sleep(config.processingDelayMs);
 
   const count = await recordVote(pool, event);
-  if (count === null) return;
+  if (count === null) {
+    metrics.votes.labels('duplicate').inc();
+    return;
+  }
+  metrics.votes.labels('stored').inc();
 
   // PostgreSQL is the source of truth. Redis gets the absolute value, so replays are harmless.
   await redis

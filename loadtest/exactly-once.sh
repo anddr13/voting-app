@@ -5,6 +5,8 @@
 #      whatever they had processed but not committed yet;
 #   3. once the consumers catch up, SELECT count(*) of this run's votes must equal the number of
 #      votes k6 got a 202 for, and the tallies must add up to the votes table.
+# It also prints how many redelivered votes the workers skipped (worker_votes_total in Prometheus):
+# that is the proof the kill actually caused redeliveries.
 # Exit code 0 = passed.
 #
 #   loadtest/exactly-once.sh                      # defaults: RATE=200 DURATION=2m KILL_AFTER=40s
@@ -36,6 +38,7 @@ psql() {
 }
 run_count() { psql "SELECT count(*) FROM votes WHERE client_id LIKE '${RUN_ID}-%'"; }
 
+started=$SECONDS
 echo "run $RUN_ID: $RATE votes/s for $DURATION, workers killed after ${KILL_AFTER}s"
 k6_out=$(mktemp)
 # k6 runs on the kind Docker network and goes straight to Traefik's NodePort, the same path as the browser.
@@ -71,9 +74,14 @@ stored=$(run_count)
 total=$(psql "SELECT count(*) FROM votes")
 tallied=$(psql "SELECT coalesce(sum(count), 0) FROM tallies")
 
+# Through Grafana's datasource proxy, the one HTTP entry point of the stand. Informational only.
+duplicates=$(curl -fsS -H 'Host: grafana.localhost' -G http://localhost:8090/api/datasources/proxy/uid/prometheus/api/v1/query   --data-urlencode "query=sum(increase(worker_votes_total{outcome=\"duplicate\"}[$((SECONDS - started + 60))s]))" 2> /dev/null |
+  sed -nE 's/.*"value":\[[^,]*,"([0-9.]+)".*//p' | cut -d. -f1)
+
 echo "accepted by vote-api:  $accepted"
 echo "stored for this run:   $stored"
 echo "votes table / tallies: $total / $tallied"
+echo "redeliveries skipped:  ${duplicates:-n/a} (Prometheus, approximate)"
 if [ "$stored" -eq "$accepted" ] && [ "$total" -eq "$tallied" ]; then
   echo "PASS: every accepted vote stored exactly once"
 else

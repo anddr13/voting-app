@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@confluentinc/kafka-javascript": "^1.11.0",
+    "@prometheus-io/client": "^0.16.1",
     "ioredis": "^6.0.0",
     "pg": "^8.23.1"
   },

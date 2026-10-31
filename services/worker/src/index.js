@@ -6,7 +6,8 @@ const Redis = require('ioredis');
 const { Kafka, logLevel } = require('@confluentinc/kafka-javascript').KafkaJS;
 const config = require('./config');
 const { parseEvent } = require('./event');
-const { connectStore, recordVote } = require('./store');
+const { createPool, recordVote } = require('./store');
+const metrics = require('./metrics');
 
 const redis = new Redis(config.redisUrl);
 const kafka = new Kafka({
@@ -23,24 +24,33 @@ const dlq = kafka.producer();
 
 let consuming = false;
 
-const health = http.createServer((req, res) => {
+const health = http.createServer(async (req, res) => {
+  if (req.url === '/metrics') {
+    res.writeHead(200, { 'Content-Type': metrics.register.contentType }).end(await metrics.register.metrics());
+    return;
+  }
   const ok = req.url === '/healthz' || (req.url === '/readyz' && consuming);
   res.writeHead(ok ? 200 : 503).end(ok ? 'ok' : 'not ready');
 });
 
-async function handle(store, message) {
+async function handle(pool, message) {
   const event = parseEvent(message.value, config.voteOptions);
   if (!event) {
     // Poison message: park it in the DLQ instead of blocking the partition forever.
     await dlq.send({ topic: config.dlqTopic, messages: [{ key: message.key, value: message.value }] });
+    metrics.votes.labels('dlq').inc();
     return;
   }
   if (config.processingDelayMs > 0) await sleep(config.processingDelayMs);
 
-  const count = await recordVote(store, event);
-  if (count === null) return;
+  const count = await recordVote(pool, event);
+  if (count === null) {
+    metrics.votes.labels('duplicate').inc();
+    return;
+  }
+  metrics.votes.labels('stored').inc();
 
-  // Mongo is the source of truth. Redis gets the absolute value, so replays are harmless.
+  // PostgreSQL is the source of truth. Redis gets the absolute value, so replays are harmless.
   await redis
     .multi()
     .hset('tallies', event.option, count)
@@ -51,11 +61,12 @@ async function handle(store, message) {
 async function main() {
   health.listen(config.port, () => console.log(`worker health on :${config.port}`));
 
-  const store = await connectStore(config.mongoUrl, config.mongoDb);
+  const pool = createPool(config.pgPoolMax);
+  await pool.query('SELECT 1');
   await dlq.connect();
   await consumer.connect();
   await consumer.subscribe({ topics: [config.kafkaTopic] });
-  await consumer.run({ eachMessage: ({ message }) => handle(store, message) });
+  await consumer.run({ eachMessage: ({ message }) => handle(pool, message) });
   consuming = true;
   console.log(`worker consuming ${config.kafkaTopic} as ${config.groupId}`);
 
@@ -63,7 +74,7 @@ async function main() {
     consuming = false;
     await consumer.disconnect().catch(() => {});
     await dlq.disconnect().catch(() => {});
-    await store.client.close().catch(() => {});
+    await pool.end().catch(() => {});
     redis.disconnect();
     health.close();
     process.exit(0);

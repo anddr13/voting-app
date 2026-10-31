@@ -10,6 +10,7 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src
+COPY migrations ./migrations
 # Numeric UID so Kubernetes can verify runAsNonRoot ("node" is uid 1000 in the base image).
 USER 1000:1000
 EXPOSE 8080

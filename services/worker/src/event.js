@@ -1,5 +1,8 @@
 'use strict';
 
+// vote-api sets voteId with crypto.randomUUID(); the votes table stores it as uuid.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // Returns a normalized vote event, or null when the message can never be processed.
 function parseEvent(value, options) {
   if (!value) return null;
@@ -10,7 +13,7 @@ function parseEvent(value, options) {
   } catch {
     return null;
   }
-  if (!raw || typeof raw.voteId !== 'string' || !options.includes(raw.option)) return null;
+  if (!raw || !UUID.test(raw.voteId) || !options.includes(raw.option)) return null;
 
   const ts = new Date(raw.ts);
   return {

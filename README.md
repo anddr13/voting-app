@@ -1,26 +1,29 @@
 # voting-app
 
 **The entry point of a multi-cloud GitOps project.** The classic "cats vs dogs" voting app, rebuilt as a small
-event-driven system on **Kafka + Redis + MongoDB**, and deployed with the **same Helm charts and Argo CD** to
+event-driven system on **Kafka + Redis + PostgreSQL**, and deployed with the **same Helm charts and Argo CD** to
 **AKS, EKS, GKE and a local kind cluster**. Each cloud is a pay-per-hour sandbox that is created, load-tested and
 destroyed again.
 
-- Exactly-once vote counting on top of at-least-once Kafka delivery (idempotent writes in a MongoDB transaction).
+- Exactly-once vote counting on top of at-least-once Kafka delivery (`INSERT ... ON CONFLICT DO NOTHING` in PostgreSQL),
+  verified with k6 while the consumers are killed with SIGKILL.
 - The worker autoscales on **Kafka consumer lag** with KEDA, measured under load in three environments.
 - GitOps end to end: CI never touches a cluster; it bumps an image tag in Git and Argo CD rolls it out everywhere.
 - Terraform per cloud, keyless CI (OIDC / federated credentials / Workload Identity), no secrets in GitHub.
 - Cost and tear-down hygiene: nightly destroy, budget alerts, and a drain step so nothing Kubernetes created outlives the cluster.
+- The kind stand is also the "production" that [ai-sre-agent](https://github.com/anddr13/ai-sre-agent) breaks and investigates.
 
 ## Repositories
 
 | Repository | What it holds | How it runs |
 |---|---|---|
 | **voting-app** (this one) | the three services, local stack, load test | CI: test → build → Trivy → GHCR → image tag into voting-gitops |
-| [voting-gitops](https://github.com/anddr13/voting-gitops) | Argo CD app of apps, Helm charts (Traefik, KEDA, Strimzi Kafka, Redis, MongoDB, the app), per-cloud overrides | watched by Argo CD in every cluster |
+| [voting-gitops](https://github.com/anddr13/voting-gitops) | Argo CD app of apps, Helm charts (Traefik, KEDA, Strimzi Kafka, Redis, CloudNativePG, the app), per-cloud overrides | watched by Argo CD in every cluster (kind: the `lab` branch) |
 | [voting-infra-azure](https://github.com/anddr13/voting-infra-azure) | Terraform: AKS + Argo CD bootstrap | GitHub Actions, federated credentials, nightly destroy |
 | [voting-infra-aws](https://github.com/anddr13/voting-infra-aws) | Terraform: EKS + Argo CD bootstrap | `make up` / `make down` from a laptop (the account's SCPs rule out GitHub OIDC) |
 | [voting-infra-gcp](https://github.com/anddr13/voting-infra-gcp) | Terraform: GKE + Argo CD bootstrap | GitHub Actions, Workload Identity Federation, nightly destroy |
 | [voting-infra-local](https://github.com/anddr13/voting-infra-local) | kind + Argo CD, the free stand-in | `scripts/up.sh` / `down.sh` on a laptop |
+| [ai-sre-agent](https://github.com/anddr13/ai-sre-agent) | read-only incident investigation agent, runbooks, chaos scenarios | against the kind stand |
 
 ## How it fits together
 
@@ -30,7 +33,7 @@ voting-app ── CI: test, build, Trivy scan ──▶ ghcr.io/anddr13/voting-*
                                                                    │
 voting-infra-azure  (GitHub Actions, OIDC)  ── Terraform ──▶ AKS ──┤
 voting-infra-gcp    (GitHub Actions, OIDC)  ── Terraform ──▶ GKE ──┤  Argo CD + "root" Application, then waves:
-voting-infra-aws    (laptop, aws login)     ── Terraform ──▶ EKS ──┤  traefik/keda/strimzi → kafka/redis/mongo → app
+voting-infra-aws    (laptop, aws login)     ── Terraform ──▶ EKS ──┤  traefik/keda/strimzi/cnpg → kafka/redis/postgres → app
 voting-infra-local  (laptop)                ── kind + helm ─▶ kind ─┘
 ```
 
@@ -39,7 +42,8 @@ The clouds differ only in Terraform and in one small `envs/<cloud>.yaml` (load b
 ## Results
 
 Same app, same charts, k6 at **200 votes/s for 3 minutes**, every request from a different client id, worker slowed
-down with `PROCESSING_DELAY_MS=20` so the lag is visible. Measured 2026-10-26.
+down with `PROCESSING_DELAY_MS=20` so the lag is visible. Measured 2026-10-26, with the MongoDB version of the data
+layer (the move to PostgreSQL came later; the Kafka and KEDA side did not change).
 
 | | [kind](https://github.com/anddr13/voting-infra-local#results-measured-2026-10-26) | [AKS](https://github.com/anddr13/voting-infra-azure#results-measured-2026-10-26) | [EKS](https://github.com/anddr13/voting-infra-aws#results-measured-2026-10-26) | GKE |
 |---|---|---|---|---|
@@ -73,15 +77,15 @@ Things that only showed up once it ran for real, all fixed and documented in the
 browser ──POST /api/vote──▶ vote-api ──produce──▶ Kafka (topic: votes, 6 partitions)
    ▲                          │ rate limit                 │
    │ SSE /api/stream          ▼                            ▼
-result-api ◀──SUBSCRIBE──── Redis ◀──HSET + PUBLISH──── worker ──transaction──▶ MongoDB
-   └── GET /api/results: from Redis, rebuilt from Mongo when the cache is empty   (votes + tallies)
+result-api ◀──SUBSCRIBE──── Redis ◀──HSET + PUBLISH──── worker ──INSERT ... ON CONFLICT──▶ PostgreSQL (primary)
+   └── GET /api/results: from Redis, rebuilt from the tallies on the replicas when the cache is empty
 ```
 
 | Service | Responsibility |
 |---|---|
 | `vote-api` | Validates the vote, rate-limits it (`SET NX EX` in Redis: one vote per client every N seconds), publishes the event to Kafka with an idempotent producer and answers `202` right away. |
-| `worker` | Consumes Kafka (consumer group `vote-workers`). In a single MongoDB transaction it inserts the event with `_id = voteId` and `$inc`s the tally, so a redelivered message hits a duplicate key and is not counted twice. Unparseable messages go to `votes-dlq`. After the commit it writes the **absolute** count to Redis and publishes an update. |
-| `result-api` | Serves the UI, `/api/results` and live updates over SSE (Redis pub/sub, at most one snapshot per 250 ms). Rebuilds the cache from Mongo when Redis is empty. |
+| `worker` | Consumes Kafka (consumer group `vote-workers`). One SQL statement inserts the vote with `ON CONFLICT (vote_id) DO NOTHING` and bumps the tally only if the vote was new, so a redelivered message is not counted twice. Unparseable messages go to `votes-dlq`. Then it writes the **absolute** count to Redis and publishes an update. Exposes `worker_votes_total` (outcome: stored, duplicate, dlq) on `/metrics`. Owns the schema: `migrations/*.sql`, applied by `src/migrate.js` (a PreSync Job in Kubernetes). |
+| `result-api` | Serves the UI, `/api/results` and live updates over SSE (Redis pub/sub, at most one snapshot per 250 ms). Rebuilds the cache from PostgreSQL when Redis is empty, reading from the replicas (`voting-pg-ro`). |
 
 The Kafka client is [`@confluentinc/kafka-javascript`](https://github.com/confluentinc/confluent-kafka-javascript)
 (librdkafka with a KafkaJS-style API); `kafkajs` itself has not been released since 2023.
@@ -99,27 +103,30 @@ PostgreSQL; every extra component is there for the bursts or for the readers.
 | **KEDA** | Scales the worker on consumer lag, the signal that actually describes a queue consumer. | A CPU-based HPA misses the backlog: the worker mostly waits on I/O, so CPU stays low while the lag grows. | An HPA on an external metric through Prometheus Adapter: more moving parts, same result. |
 
 **Exactly-once counting is the core of the design.** Kafka delivers at least once: after a worker crash or a consumer
-group rebalance, the same message can arrive again. The worker inserts the vote with `_id = voteId` and increments the
-tally in the same MongoDB transaction, so a redelivered vote fails on the duplicate key and changes nothing. Redis gets
-the absolute count returned by that transaction, never an increment, so a repeated cache update is harmless too. On
-the way in, the idempotent producer keeps network retries from writing the same message to Kafka twice. Verified in
-every environment: each accepted vote was stored exactly once (see [Results](#results)).
+group rebalance, the same message can arrive again. The worker stores a vote with one statement: a CTE inserts it with
+`ON CONFLICT (vote_id) DO NOTHING` (`vote_id` is the primary key, set by vote-api) and adds 1 to the tally only for a
+row that was actually inserted. A redelivered vote inserts nothing and therefore counts nothing. Redis gets the absolute
+count returned by that statement, never an increment, so a repeated cache update is harmless too. On the way in, the
+idempotent producer keeps network retries from writing the same message to Kafka twice. `loadtest/exactly-once.sh`
+proves it on kind: k6 sends votes, every worker gets SIGKILL mid-run, and `count(*)` must equal the accepted votes.
+Two runs in a row: 24,001 and 23,244 votes, each stored exactly once, with 845 and 1,024 redeliveries skipped.
 
-**Why MongoDB and not PostgreSQL.** PostgreSQL fits this data at least as well: a vote and a tally are fixed-shape rows,
-and `INSERT ... ON CONFLICT DO NOTHING` plus `UPDATE ... SET count = count + 1` in one transaction give the same
-guarantee on a single instance. MongoDB allows transactions only on a replica set, hence the one-member replica set.
-Managed MongoDB also differs from cloud to cloud (Amazon DocumentDB, Azure Cosmos DB for MongoDB, Firestore with
-MongoDB compatibility, or Atlas), while all three run PostgreSQL natively. MongoDB was chosen on purpose, to show a
-document store next to Kafka and Redis; a production system with this data model would use PostgreSQL.
+**Why PostgreSQL (it was MongoDB first).** A vote and a tally are fixed-shape rows, and one `INSERT ... ON CONFLICT`
+statement gives the exactly-once guarantee without a multi-document transaction (MongoDB needs a replica set even for
+that). The first version used MongoDB on purpose, to show a document store next to Kafka and Redis. It moved to
+PostgreSQL on CloudNativePG (a primary and a streaming replica) when the stand became the target of
+[ai-sre-agent](https://github.com/anddr13/ai-sre-agent): failover, replica lag and connection exhaustion are the
+database incidents worth investigating, and every cloud also runs PostgreSQL natively.
 
-**Self-hosted, not managed services.** Kafka (Strimzi), Redis and MongoDB run inside the cluster, so the same charts
+**Self-hosted, not managed services.** Kafka (Strimzi), Redis and PostgreSQL (CloudNativePG) run inside the cluster, so the same charts
 work on AKS, EKS, GKE and kind, and a sandbox that lives a few hours costs nothing beyond its nodes. In production,
 the managed Kafka and Redis that every cloud offers would trade this portability for less operational work.
 
 What a production version would change:
-- **Everything runs as a single replica.** One Kafka broker with replication factor 1, one Redis pod, a one-member
-  MongoDB replica set: losing a disk loses data. That keeps a sandbox on two small nodes; production needs 3 brokers
-  with `replication.factor=3` and `min.insync.replicas=2`, a 3-member replica set (or HA PostgreSQL) and a replicated Redis.
+- **Little redundancy in the clouds.** One Kafka broker with replication factor 1, one Redis pod, PostgreSQL with one
+  replica: losing a disk loses Kafka data. That keeps a sandbox on two small nodes; production needs 3 brokers with
+  `replication.factor=3` and `min.insync.replicas=2` (the kind stand already runs that), backups for PostgreSQL and a
+  replicated Redis.
 - **The 20 ms processing delay is synthetic.** It stands in for real per-vote work (fraud checks, enrichment) and makes
   the backlog visible in a 3-minute test. Without it a message takes ~10 ms on AKS (~30 ms measured minus the delay),
   so two workers would keep up with 200 votes/s.
@@ -138,7 +145,7 @@ open http://localhost:8080          # UI
 docker compose down -v
 ```
 
-Compose starts Kafka (KRaft, no ZooKeeper), Redis, MongoDB (a single-node replica set, required for transactions),
+Compose starts Kafka (KRaft, no ZooKeeper), Redis, PostgreSQL, a one-shot `migrate` service for the schema,
 the three services, and Caddy acting as the Ingress (`/api/vote` → vote-api, everything else → result-api).
 
 Poking it by hand:
@@ -158,8 +165,15 @@ docker run --rm -i -e BASE_URL=http://host.docker.internal:8080 grafana/k6:2.3.0
 To watch consumer lag grow (and, in a cluster, KEDA adding workers), slow processing down:
 `PROCESSING_DELAY_MS=20 docker compose up -d worker`.
 
-Verified with compose: 3,006 votes under load, every one counted exactly once, p95 latency 15 ms, 0 errors.
-Redelivered messages, poison messages (→ DLQ) and a full Redis flush were tested as well.
+Exactly-once on the kind stand (voting-infra-local), with the workers killed mid-run:
+
+```bash
+loadtest/exactly-once.sh                      # RATE=200 DURATION=2m KILL_AFTER=40s by default; exit code 0 = passed
+```
+
+It also prints how many redelivered votes the workers skipped (from `worker_votes_total` in Prometheus): the proof
+that the kill really caused redeliveries. `kubectl delete pod --force` would not: the kubelet still sends SIGTERM and
+the worker commits its offsets on the way out, so the script sends SIGKILL from the kind node instead.
 
 ## Tests
 
@@ -172,8 +186,8 @@ cd services/vote-api && npm ci && npm test     # same for worker and result-api
 `.github/workflows/ci.yml`:
 1. **test**: `npm ci` + `npm test` for every service.
 2. **image**: build, Trivy scan (fails on CRITICAL), push to `ghcr.io/anddr13/voting-<service>:<sha>` and `:latest` (from `main` only).
-3. **release**: commits the new image tag to `voting-gitops` (`charts/voting/values.yaml`). Argo CD in every running
-   cluster then rolls the version out on its own. CI never talks to the clusters and holds no cloud credentials.
+3. **release**: commits the new image tag to `voting-gitops` (`charts/voting/values.yaml`), on `main` (the clouds)
+   and on `lab` (kind). Argo CD in every running cluster then rolls the version out on its own. CI never talks to the clusters and holds no cloud credentials.
 
 One-time setup:
 - Secret `GITOPS_TOKEN`: a fine-grained PAT with **Contents: Read and write** on `voting-gitops` only.

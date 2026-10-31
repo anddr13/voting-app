@@ -75,8 +75,10 @@ total=$(psql "SELECT count(*) FROM votes")
 tallied=$(psql "SELECT coalesce(sum(count), 0) FROM tallies")
 
 # Through Grafana's datasource proxy, the one HTTP entry point of the stand. Informational only.
-duplicates=$(curl -fsS -H 'Host: grafana.localhost' -G http://localhost:8090/api/datasources/proxy/uid/prometheus/api/v1/query   --data-urlencode "query=sum(increase(worker_votes_total{outcome=\"duplicate\"}[$((SECONDS - started + 60))s]))" 2> /dev/null |
-  sed -nE 's/.*"value":\[[^,]*,"([0-9.]+)".*//p' | cut -d. -f1)
+window=$((SECONDS - started + 60))
+duplicates=$(curl -fsS -H 'Host: grafana.localhost' -G http://localhost:8090/api/datasources/proxy/uid/prometheus/api/v1/query \
+  --data-urlencode "query=sum(increase(worker_votes_total{outcome=\"duplicate\"}[${window}s]))" 2> /dev/null |
+  sed -nE 's/.*"value":\[[^,]*,"([0-9.]+)".*/\1/p' | cut -d. -f1)
 
 echo "accepted by vote-api:  $accepted"
 echo "stored for this run:   $stored"

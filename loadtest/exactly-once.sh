@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Exactly-once check on the kind stand (voting-infra-local):
 #   1. k6 sends votes for DURATION, every client id prefixed with a fresh RUN_ID;
-#   2. after KILL_AFTER all worker pods are killed (no graceful shutdown), so Kafka redelivers
-#      whatever they had processed but not committed yet;
+#   2. after KILL_AFTER every worker process gets SIGKILL (a crash: no shutdown hook, no final offset
+#      commit), so Kafka redelivers whatever they had processed but not committed yet;
 #   3. once the consumers catch up, SELECT count(*) of this run's votes must equal the number of
 #      votes k6 got a 202 for, and the tallies must add up to the votes table.
 # It also prints how many redelivered votes the workers skipped (worker_votes_total in Prometheus):
@@ -48,8 +48,15 @@ docker run --rm -i --network kind -e BASE_URL=http://$CLUSTER-control-plane:3008
 k6_pid=$!
 
 sleep "$KILL_AFTER"
-echo "killing workers: $(kubectl -n voting get pod -l app.kubernetes.io/name=worker -o name | tr '\n' ' ')"
-kubectl -n voting delete pod -l app.kubernetes.io/name=worker --grace-period=0 --force 2> /dev/null | sed 's/^/  /'
+# Not `kubectl delete pod --force`: the kubelet still sends SIGTERM first, the worker disconnects
+# cleanly and commits its offsets, and nothing is redelivered. SIGKILL from inside the container does
+# not work either (PID 1 ignores it). So the process is killed from the kind node, via crictl.
+echo "SIGKILL to every worker process:"
+docker exec "$CLUSTER-control-plane" sh -c '
+  for id in $(crictl ps -q --name "^worker$"); do
+    pid=$(crictl inspect -o go-template --template "{{.info.pid}}" "$id")
+    kill -9 "$pid" && echo "  container ${id%"${id#????????????}"} pid $pid"
+  done'
 
 wait "$k6_pid"
 summary=$(grep '^ACCEPTED=' "$k6_out")

@@ -43,18 +43,19 @@ The clouds differ only in Terraform and in one small `envs/<cloud>.yaml` (load b
 
 Same app, same charts, k6 at **200 votes/s for 3 minutes**, every request from a different client id, worker slowed
 down with `PROCESSING_DELAY_MS=20` so the lag is visible. Measured 2026-10-26, with the MongoDB version of the data
-layer (the move to PostgreSQL came later; the Kafka and KEDA side did not change).
+layer (the move to PostgreSQL came later; the Kafka and KEDA side did not change). GKE came up on 2026-11-01
+already with PostgreSQL; there only bring-up and tear-down were measured.
 
-| | [kind](https://github.com/anddr13/voting-infra-local#results-measured-2026-10-26) | [AKS](https://github.com/anddr13/voting-infra-azure#results-measured-2026-10-26) | [EKS](https://github.com/anddr13/voting-infra-aws#results-measured-2026-10-26) | GKE |
+| | [kind](https://github.com/anddr13/voting-infra-local#results-measured-2026-10-26) | [AKS](https://github.com/anddr13/voting-infra-azure#results-measured-2026-10-26) | [EKS](https://github.com/anddr13/voting-infra-aws#results-measured-2026-10-26) | [GKE](https://github.com/anddr13/voting-infra-gcp#results-measured-2026-11-01) |
 |---|---|---|---|---|
-| Nodes | laptop (Docker) | 2 × D2as_v5 | 2 × m6i.large | code ready, not applied yet |
-| Bring-up to a working app | 5 min 23 s | 9 min 34 s | 17 min 36 s | |
-| Worker scale-out | 1 → 6 in 37 s | 1 → 6 in 41 s | 1 → 6 in 53 s | |
+| Nodes | laptop (Docker) | 2 × D2as_v5 | 2 × m6i.large | 2 × e2-standard-2 (spot) |
+| Bring-up to a working app | 5 min 23 s | 9 min 34 s | 17 min 36 s | 16 min 12 s |
+| Worker scale-out | 1 → 6 in 37 s | 1 → 6 in 41 s | 1 → 6 in 53 s | not load-tested |
 | Consumer lag under load | grew to 9,251 | flat at ~3,900 | peaked at 5,185, **shrank under load** | |
 | Requests / failed | 35,578 / 0 | 36,001 / 0 | 36,000 / 0 | |
 | p95 latency | 12 ms (local) | 74 ms (laptop → Sweden) | 78 ms (laptop → Stockholm) | |
-| Counted exactly once | ✅ 35,581 | ✅ 36,006 | ✅ 36,004 | |
-| Tear-down | seconds | 7 min 50 s, nothing left | 13 min 26 s, nothing left | |
+| Counted exactly once | ✅ 35,581 | ✅ 36,006 | ✅ 36,004 | smoke test: 1 vote end to end |
+| Tear-down | seconds | 7 min 50 s, nothing left | 13 min 26 s, nothing left | 10 min 8 s, nothing left |
 
 Six workers are the ceiling everywhere: the `votes` topic has 6 partitions. The nodes stayed below 50% CPU on AKS,
 so going further means more partitions or batch processing, not a bigger cluster.

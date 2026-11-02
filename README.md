@@ -41,24 +41,30 @@ The clouds differ only in Terraform and in one small `envs/<cloud>.yaml` (load b
 
 ## Results
 
-Same app, same charts, k6 at **200 votes/s for 3 minutes**, every request from a different client id, worker slowed
-down with `PROCESSING_DELAY_MS=20` so the lag is visible. Measured 2026-10-26, with the MongoDB version of the data
-layer (the move to PostgreSQL came later; the Kafka and KEDA side did not change). GKE came up on 2026-11-01
-already with PostgreSQL; there only bring-up and tear-down were measured.
+Same app, same charts, k6 on a laptop in Ukraine at **200 votes/s for 3 minutes**, every request from a different
+client id, worker slowed down with `PROCESSING_DELAY_MS=20` so the lag is visible. The three clouds were measured
+on 2026-11-02 with the PostgreSQL version and `loadtest/exactly-once-cloud.sh`: 40 s into the load **every worker
+process gets SIGKILL**, and a run passes only if `count(*)` of its votes equals the votes vote-api accepted.
+The kind column is the 2026-10-26 run, still on MongoDB and without the kill.
 
-| | [kind](https://github.com/anddr13/voting-infra-local#results-measured-2026-10-26) | [AKS](https://github.com/anddr13/voting-infra-azure#results-measured-2026-10-26) | [EKS](https://github.com/anddr13/voting-infra-aws#results-measured-2026-10-26) | [GKE](https://github.com/anddr13/voting-infra-gcp#results-measured-2026-11-01) |
+| | [kind](https://github.com/anddr13/voting-infra-local#results-measured-2026-10-26) | [AKS](https://github.com/anddr13/voting-infra-azure#results-measured-2026-11-02-postgresql) | [EKS](https://github.com/anddr13/voting-infra-aws#results-measured-2026-11-02-postgresql) | [GKE](https://github.com/anddr13/voting-infra-gcp#results-measured-2026-11-02-postgresql) |
 |---|---|---|---|---|
 | Nodes | laptop (Docker) | 2 × D2as_v5 | 2 × m6i.large | 2 × e2-standard-2 (spot) |
-| Bring-up to a working app | 5 min 23 s | 9 min 34 s | 17 min 36 s | 16 min 12 s |
-| Worker scale-out | 1 → 6 in 37 s | 1 → 6 in 41 s | 1 → 6 in 53 s | not load-tested |
-| Consumer lag under load | grew to 9,251 | flat at ~3,900 | peaked at 5,185, **shrank under load** | |
-| Requests / failed | 35,578 / 0 | 36,001 / 0 | 36,000 / 0 | |
-| p95 latency | 12 ms (local) | 74 ms (laptop → Sweden) | 78 ms (laptop → Stockholm) | |
-| Counted exactly once | ✅ 35,581 | ✅ 36,006 | ✅ 36,004 | smoke test: 1 vote end to end |
-| Tear-down | seconds | 7 min 50 s, nothing left | 13 min 26 s, nothing left | 10 min 8 s, nothing left |
+| Bring-up to a working app | 5 min 23 s | 14 min 41 s | 15 min 53 s | 12 min 57 s |
+| Worker scale-out | 1 → 6 in 37 s | 1 → 6 in 36 s | 1 → 6 in 42 s | 1 → 6 in 39 s |
+| Consumer lag: peak, back to 0 | grew to 9,251 | 11,277, 62 s after the load | 14,580, 55 s after | 17,260, 81 s after |
+| Requests / failed | 35,578 / 0 | 35,970 / 0 | 35,963 / 0 | 35,991 / 0 |
+| p95 latency | 12 ms (local) | 84 ms (→ Sweden) | 78 ms (→ Stockholm) | 84 ms (→ Warsaw) |
+| Counted exactly once | ✅ 35,581 | ✅ 35,970, 257 redeliveries skipped | ✅ 35,963, 81 skipped | ✅ 35,991, 194 skipped |
+| Tear-down | seconds | 19 min 11 s, nothing left ¹ | 12 min 42 s, nothing left | 10 min 24 s, nothing left |
 
-Six workers are the ceiling everywhere: the `votes` topic has 6 partitions. The nodes stayed below 50% CPU on AKS,
-so going further means more partitions or batch processing, not a bigger cluster.
+The lag peaks are higher than in the MongoDB runs (AKS ~3,900, EKS 5,185, kept in the infra repos) because of the
+kill: all six workers restart and the consumer group rebalances, and for those seconds nobody consumes. Six workers
+are the ceiling everywhere: the `votes` topic has 6 partitions. The AKS nodes peaked at ~50% CPU, so going further
+means more partitions or batch processing, not a bigger cluster.
+
+¹ The first destroy hung: the cascade deleted the Kafka cluster before its topics, and nobody was left to remove
+their finalizers. Fixed in `drain-cluster.sh`; the time is the rerun.
 
 ## What the real clouds taught
 
@@ -71,6 +77,7 @@ Things that only showed up once it ran for real, all fixed and documented in the
 - **An AWS-managed organization** denies the GitHub OIDC provider and Spot, and "pauses resources" near the spend limit with a `DenyCompute` SCP.
 - **GitHub delayed a nightly cron by 4 h 42 min**, so the destroy now runs twice, off the top of the hour.
 - **Kubernetes creates cloud resources Terraform does not know about** (load balancers, disks): every destroy drains the cluster first, then checks for leftovers.
+- **A cascading delete can deadlock on finalizers.** On AKS the Kafka cluster (and with it the Strimzi topic operator) went before its KafkaTopics, whose finalizer only that operator removes, so the drain hung. The drain now drops those finalizers once no Kafka is left.
 
 ## The app
 
@@ -111,6 +118,7 @@ count returned by that statement, never an increment, so a repeated cache update
 idempotent producer keeps network retries from writing the same message to Kafka twice. `loadtest/exactly-once.sh`
 proves it on kind: k6 sends votes, every worker gets SIGKILL mid-run, and `count(*)` must equal the accepted votes.
 Two runs in a row: 24,001 and 23,244 votes, each stored exactly once, with 845 and 1,024 redeliveries skipped.
+`loadtest/exactly-once-cloud.sh` does the same on AKS, EKS and GKE (see [Results](#results)).
 
 **Why PostgreSQL (it was MongoDB first).** A vote and a tally are fixed-shape rows, and one `INSERT ... ON CONFLICT`
 statement gives the exactly-once guarantee without a multi-document transaction (MongoDB needs a replica set even for
@@ -175,6 +183,13 @@ loadtest/exactly-once.sh                      # RATE=200 DURATION=2m KILL_AFTER=
 It also prints how many redelivered votes the workers skipped (from `worker_votes_total` in Prometheus): the proof
 that the kill really caused redeliveries. `kubectl delete pod --force` would not: the kubelet still sends SIGTERM and
 the worker commits its offsets on the way out, so the script sends SIGKILL from the kind node instead.
+
+The same check in a cloud cluster, plus worker replicas, consumer lag and node CPU every 10 s. The kill goes through a
+`kubectl debug node` pod, since there is no node to `docker exec` into:
+
+```bash
+KUBECONFIG=~/.kube/voting-azure EXPECT=voting-dev-aks loadtest/exactly-once-cloud.sh   # output in loadtest/out/<run id>/
+```
 
 ## Tests
 
